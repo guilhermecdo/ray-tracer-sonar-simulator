@@ -17,7 +17,10 @@ class GPUFLSSimulator:
         min_range: float = 0.5,
         max_range: float = 15.0,
         attenuation_db_per_km: float = 10.0,
-        multipath_gain: float = 0.55,
+        multipath_gain: float = 1.5,
+        max_bounces: int = 3,
+        roughness: float = 0.22,
+        log_gain: float = 12.0,
     ):
         self.scene = scene
         self.az_rays = az_rays
@@ -34,9 +37,13 @@ class GPUFLSSimulator:
         gamma_np_per_km = 0.0115 * float(attenuation_db_per_km)
         self.gamma_np_per_m = gamma_np_per_km / 1000.0
         self.multipath_gain = float(multipath_gain)
+        self.max_bounces = int(max_bounces)
+        self.roughness = float(roughness)
+        self.log_gain = float(log_gain)
 
         self.polar_img = ti.field(dtype=ti.f32, shape=(az_bins, range_bins))
         self.noisy_img = ti.field(dtype=ti.f32, shape=(az_bins, range_bins))
+        self.depth_img = ti.field(dtype=ti.f32, shape=(az_rays, el_rays))
 
     @ti.func
     def _hit_aabb(self, orig, dir_vec, bmin, bmax, t_max) -> ti.i32:
@@ -95,9 +102,9 @@ class GPUFLSSimulator:
 
     @ti.func
     def _attenuate(self, intensity, dist_m) -> ti.f32:
-        # Spherical spreading + exponential absorption I_d = I_0 * exp(-2 * gamma * d)
-        spreading = 1.0 / (1.0 + 0.05 * dist_m * dist_m)
-        return intensity * spreading * ti.exp(-2.0 * self.gamma_np_per_m * dist_m)
+        # TVG/RVG compensates 1/R^2 spherical spreading (Aykin & Negahdaripour 2016, Eq. 5/36);
+        # only exponential water absorption exp(-2 * gamma * R) remains.
+        return intensity * ti.exp(-2.0 * self.gamma_np_per_m * dist_m)
 
     @ti.func
     def _deposit_polar(self, az_rad, range_m, intensity):
@@ -107,9 +114,14 @@ class GPUFLSSimulator:
             b_az = int(az_norm * self.az_bins)
             b_r = int(r_norm * self.range_bins)
             if 0 <= b_az < self.az_bins and 0 <= b_r < self.range_bins:
-                # Normalize across elevation rays so image brightness stays balanced
+                # Integral over elevation patches: sum_j k * cos(alpha) * cos(phi) * d_phi
+                # Convolved with finite pulse width (Delta_pl ~ 3 * delta_R, Sec. III-B / IV-A)
                 val = intensity * (16.0 / float(self.el_rays))
-                ti.atomic_add(self.polar_img[b_az, b_r], val)
+                w = 1.0 / 3.0
+                for dr in ti.static(range(3)):
+                    rr = b_r + dr - 1
+                    if 0 <= rr < self.range_bins:
+                        ti.atomic_add(self.polar_img[b_az, rr], val * w)
 
     @ti.kernel
     def step_ping(self, sonar_pos: ti.types.vector(3, ti.f32), yaw_rad: ti.f32, pitch_rad: ti.f32):
@@ -142,48 +154,73 @@ class GPUFLSSimulator:
 
             # 1. Primary ray hit
             r1, tri1 = self._trace_closest(sonar_pos, dir_world, self.max_range)
+            self.depth_img[i, j] = r1 if tri1 >= 0 else 0.0
             if tri1 >= 0:
                 p1 = sonar_pos + dir_world * r1
                 n1 = self.scene.tri_normal[tri1].normalized()
                 refl1 = self.scene.tri_refl[tri1]
 
+                # Aykin & Negahdaripour (2016) Eq. (5)/(36): I = k * cos(alpha) * cos(phi) * d_phi
                 cos_inc1 = ti.max(n1.dot(-dir_world), 0.0)
-                i1 = self._attenuate(refl1 * ti.pow(cos_inc1, 1.5), r1)
+                cos_phi = ti.cos(el)
+                i1 = self._attenuate(refl1 * cos_inc1 * cos_phi, r1)
                 self._deposit_polar(az, r1, i1)
 
-                # 2. Multipath (secondary bounce from p1)
-                refl_dir = (dir_world - 2.0 * dir_world.dot(n1) * n1).normalized()
-                orig2 = p1 + n1 * 0.005
-                r2, tri2 = self._trace_closest(orig2, refl_dir, self.max_range)
-                if tri2 >= 0:
-                    p2 = orig2 + refl_dir * r2
-                    d3 = (sonar_pos - p2).norm()
-                    # Round-trip distance / 2 gives equivalent one-way range bin
-                    r_multi = 0.5 * (r1 + r2 + d3)
+                # 2. Multi-bounce multipath & acoustic reverberation
+                cur_pos = p1
+                cur_dir = dir_world
+                cur_n = n1
+                cum_refl = refl1
+                total_path = r1
+                bounce_decay = 1.0
 
-                    # Project p2 back into sonar frame to get multipath azimuth
-                    rel2 = p2 - sonar_pos
-                    az_multi = ti.atan2(rel2.y, rel2.x) - yaw_rad
+                for _b in range(self.max_bounces):
+                    refl_dir = (cur_dir - 2.0 * cur_dir.dot(cur_n) * cur_n).normalized()
+                    jitter = ti.Vector([ti.randn(ti.f32), ti.randn(ti.f32), ti.randn(ti.f32)])
+                    bounce_dir = (refl_dir + self.roughness * jitter).normalized()
+                    if bounce_dir.dot(cur_n) < 0.0:
+                        bounce_dir = (bounce_dir - 2.0 * bounce_dir.dot(cur_n) * cur_n).normalized()
 
-                    n2 = self.scene.tri_normal[tri2].normalized()
-                    refl2 = self.scene.tri_refl[tri2]
-                    cos_inc2 = ti.max(n2.dot(-refl_dir), 0.0)
+                    orig_next = cur_pos + cur_n * 0.005
+                    r_next, tri_next = self._trace_closest(orig_next, bounce_dir, self.max_range)
+                    if tri_next < 0:
+                        break
+
+                    p_next = orig_next + bounce_dir * r_next
+                    total_path += r_next
+                    d_back = (sonar_pos - p_next).norm()
+                    r_multi = 0.5 * (total_path + d_back)
+
+                    rel_next = p_next - sonar_pos
+                    az_multi = ti.atan2(rel_next.y, rel_next.x) - yaw_rad
+
+                    n_next = self.scene.tri_normal[tri_next].normalized()
+                    refl_next = self.scene.tri_refl[tri_next]
+                    cos_inc_next = ti.max(n_next.dot(-bounce_dir), 0.0)
+                    cum_refl *= refl_next
+
                     i_multi = self._attenuate(
-                        self.multipath_gain * refl1 * refl2 * ti.pow(cos_inc2, 1.2),
+                        self.multipath_gain * bounce_decay * cum_refl * cos_inc_next * cos_phi,
                         r_multi,
                     )
                     self._deposit_polar(az_multi, r_multi, i_multi)
+
+                    cur_pos = p_next
+                    cur_dir = bounce_dir
+                    cur_n = n_next
+                    bounce_decay *= 0.68
 
     @ti.kernel
     def apply_speckle_and_clear(self, seed_offset: ti.i32):
         for i, j in ti.ndrange(self.az_bins, self.range_bins):
             clean_val = self.polar_img[i, j]
-            # Granular multiplicative + small additive noise
+            # Granular multiplicative + small additive noise, then log compression (Sec. III-A)
             rng = ti.abs(ti.randn(ti.f32))
             mult_noise = 0.4 + 0.9 * rng
             add_noise = 0.015 * ti.abs(ti.randn(ti.f32))
-            noisy = ti.min(1.0, clean_val * mult_noise + add_noise)
-            self.noisy_img[i, j] = noisy
+            noisy_lin = ti.max(0.0, clean_val * mult_noise + add_noise)
+            log_val = ti.log(1.0 + self.log_gain * noisy_lin) / ti.log(1.0 + self.log_gain)
+            self.noisy_img[i, j] = ti.min(1.0, log_val)
             self.polar_img[i, j] = 0.0
 
     def render_ping(self, sonar_pos, yaw_deg: float = 0.0, pitch_deg: float = -12.0, seed: int = 0) -> np.ndarray:
@@ -191,3 +228,9 @@ class GPUFLSSimulator:
         self.step_ping(pos_vec, math.radians(yaw_deg), math.radians(pitch_deg))
         self.apply_speckle_and_clear(seed)
         return self.noisy_img.to_numpy()
+
+    def render_ping_with_depth(self, sonar_pos, yaw_deg: float = 0.0, pitch_deg: float = -12.0, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (polar_sonar_img, gt_raycast_depth_m) where 0.0 in depth indicates no hit within max_range."""
+        polar = self.render_ping(sonar_pos, yaw_deg=yaw_deg, pitch_deg=pitch_deg, seed=seed)
+        depth = self.depth_img.to_numpy()
+        return polar, depth

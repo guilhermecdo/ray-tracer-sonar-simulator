@@ -1,0 +1,30 @@
+{
+  "scenes_dir": "scenes",
+  "scenarios": [
+    "coral"
+  ],
+  "taichi": {
+    "arch": "gpu"
+  },
+  "scene_limits": {
+    "max_tris": 32768,
+    "max_boxes": 64
+  },
+  "sonar": {
+    "az_rays": 256,
+    "el_rays": 128,
+    "az_bins": 256,
+    "range_bins": 512,
+    "attenuation_db_per_km": 12.0,
+    "multipath_gain": 2.0,
+    "max_bounces": 3,
+    "roughness": 0.25,
+    "log_gain": 12.0
+  },
+  "display": {
+    "fan_out_size": 512,
+    "cmap": "bone",
+    "pause_sec": 0.5,
+    "save_dir": null
+  }
+}
