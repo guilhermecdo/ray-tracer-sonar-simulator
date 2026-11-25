@@ -11,8 +11,8 @@
     "max_boxes": 64
   },
   "sonar": {
-    "az_rays": 256,
-    "el_rays": 128,
+    "az_rays": 1024,
+    "el_rays": 256,
     "az_bins": 256,
     "range_bins": 512,
     "attenuation_db_per_km": 12.0,
@@ -24,7 +24,7 @@
   "display": {
     "fan_out_size": 512,
     "cmap": "bone",
-    "pause_sec": 0.5,
+    "pause_sec": 0.05,
     "save_dir": null
   }
 }

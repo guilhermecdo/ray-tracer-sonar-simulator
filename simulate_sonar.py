@@ -8,7 +8,6 @@ import taichi as ti
 from modules.mesh import SonarScene
 from modules.sonar_sim import GPUFLSSimulator
 
-
 def polar_to_cartesian_fan(
     polar_img: np.ndarray,
     az_fov_deg: float,
@@ -104,9 +103,6 @@ def run_scenario(scenario_name: str, cfg: dict):
     depth_vis = np.where(depth_img > 0.0, depth_img, np.nan)
 
     im_fan = axes[0].imshow(fan_img, origin="lower", cmap=cmap_name, vmin=0.0, vmax=1.0)
-    #axes[0].set_title("Cartesian FLS Fan Display")
-    #axes[0].set_xlabel("X (m)")
-    #axes[0].set_ylabel("Y Forward Range (m)")
 
     cmap_depth = plt.get_cmap(cmap_name).copy()
     cmap_depth.set_bad(color="black")
@@ -118,9 +114,7 @@ def run_scenario(scenario_name: str, cfg: dict):
         vmin=meta["min_range"],
         vmax=meta["max_range"],
     )
-    #axes[1].set_title("GT Raycast Depth (Azimuth vs. Elevation)")
-    #axes[1].set_xlabel("Azimuth Ray")
-    #axes[1].set_ylabel("Elevation Ray")
+
     fig.colorbar(im_depth, ax=axes[1], label="Range (m)")
 
     plt.tight_layout()
@@ -143,9 +137,7 @@ def run_scenario(scenario_name: str, cfg: dict):
 
         im_fan.set_data(fan_img)
         im_depth.set_data(depth_vis.T)
-        #fig.suptitle(
-        #    f"Scenario: {scenario_name} | View {idx + 1}/{num_views} | Orbit Az: {cam_az[idx]:.0f}°"
-        #)
+
         fig.canvas.draw_idle()
 
         if save_dir is not None:
